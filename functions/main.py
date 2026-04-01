@@ -10,10 +10,10 @@ from firebase_functions import firestore_fn
 from google import genai
 from google.genai import types
 
-# Configuration
 PROJECT_ID = "deep-sync-production"
 DEFAULT_MODEL = "gemini-2.5-flash-lite"
 SERVICE_ACCOUNT_PATH = "serviceAccountKey.json" 
+ELIGIBILITY_THRESHOLD = 50 
 
 _db_client = None
 
@@ -61,17 +61,14 @@ def _download_pdf_bytes(url: str) -> bytes:
         raise ValueError("Downloaded content is not a valid PDF file.")
     return content
 
-# --- Prompt Function (Qualifications Only - No Summary) ---
 def _build_cv_prompt() -> str:
     return """
 You are an expert CV parser.
 Read the full uploaded CV/Resume document and extract ONLY the education and certifications.
 Return strictly valid JSON:
-
 {
   "qualifications": ["list of education/certification items"]
 }
-
 Rules:
 - Return strictly JSON, no markdown and no commentary.
 - If no qualifications are found, return an empty list [].
@@ -100,8 +97,9 @@ def _evaluate_candidate_against_requirements(requirements: str, extracted_cv: Di
         f"Job Requirements:\n{requirements}\n\n"
         f"Candidate Qualifications:\n{json.dumps(extracted_cv)}\n\n"
         "Instructions: Compare the candidate's qualifications against the job requirements. "
-        "Provide a match score (0-100) and a decision ('interview' or 'reject'). "
-        "Return strictly valid JSON."
+        "Provide a match score (0-100) where 100 is a perfect match and 0 is no relevance. "
+        "Return strictly valid JSON in this format: "
+        "{\"match_score\": <int>}"
     )
     
     response = client.models.generate_content(
@@ -114,10 +112,8 @@ def _evaluate_candidate_against_requirements(requirements: str, extracted_cv: Di
     )
     parsed = _extract_json_object(response.text or "")
     return {
-        "decision": str(parsed.get("decision", "reject")).lower(),
         "match_score": int(parsed.get("match_score", 0)),
     }
-
 
 @firestore_fn.on_document_created(
     document="career/{careerId}/applications/{applicationId}",
@@ -141,6 +137,7 @@ def on_application_created(
         pdf_bytes = _download_pdf_bytes(resume_url)
         extracted = extract_cv_fields_from_pdf_bytes(pdf_bytes)
 
+
         career_id = event.params["careerId"]
         career_doc = db.collection("career").document(career_id).get()
         
@@ -150,10 +147,13 @@ def on_application_created(
         job_requirements = career_doc.to_dict().get("requirements", "No requirements listed.")
 
         screening = _evaluate_candidate_against_requirements(job_requirements, extracted)
+        
+        match_score = screening["match_score"]
+        is_eligible = match_score >= ELIGIBILITY_THRESHOLD
 
         app_ref.update({
-            "interviewEligible": screening["decision"] == "interview",
-            "matchScore": screening["match_score"],
+            "interviewEligible": is_eligible,
+            "matchScore": match_score,
             "extractedData": extracted,
             "processedAt": firestore.SERVER_TIMESTAMP
         })
@@ -162,5 +162,6 @@ def on_application_created(
         print(f"Error processing application: {exc}")
         app_ref.update({
             "interviewEligible": False, 
-            "error": str(exc)
+            "error": str(exc),
+            "processedAt": firestore.SERVER_TIMESTAMP
         })
