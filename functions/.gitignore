@@ -7,3 +7,19 @@ venv/
 
 .env
 .env*
+
+# --- Python & Environment ---
+venv/
+__pycache__/
+*.pyc
+.env
+
+# --- Firebase & Service Keys (CRITICAL) ---
+serviceAccountKey.json
+firebase-debug.log
+.firebase/
+
+# --- IDE & System ---
+.vscode/
+.idea/
+.DS_Store

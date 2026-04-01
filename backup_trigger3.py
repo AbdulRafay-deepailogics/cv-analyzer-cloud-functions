@@ -3,14 +3,12 @@ import os
 import re
 from typing import Any, Dict
 from urllib.request import Request, urlopen
-
 from dotenv import load_dotenv
 from firebase_admin import firestore, initialize_app, credentials
 from firebase_functions import firestore_fn
 from google import genai
 from google.genai import types
 
-# Configuration
 PROJECT_ID = "deep-sync-production"
 DEFAULT_MODEL = "gemini-2.5-flash-lite"
 SERVICE_ACCOUNT_PATH = "serviceAccountKey.json" 
@@ -61,30 +59,16 @@ def _download_pdf_bytes(url: str) -> bytes:
         raise ValueError("Downloaded content is not a valid PDF file.")
     return content
 
-# --- Prompt Function (Qualifications Only - No Summary) ---
-def _build_cv_prompt() -> str:
-    return """
-You are an expert CV parser.
-Read the full uploaded CV/Resume document and extract ONLY the education and certifications.
-Return strictly valid JSON:
-
-{
-  "qualifications": ["list of education/certification items"]
-}
-
-Rules:
-- Return strictly JSON, no markdown and no commentary.
-- If no qualifications are found, return an empty list [].
-- Qualifications should focus on degree, diploma, certification, and formal education.
-- Do NOT include a professional summary, objective, or bio.
-""".strip()
-
 def extract_cv_fields_from_pdf_bytes(pdf_bytes: bytes, model_name: str = DEFAULT_MODEL) -> Dict[str, Any]:
     client = _get_genai_client()
+    prompt = (
+        "You are an expert CV parser. Extract the candidate's name, contact info, "
+        "qualifications, and a professional summary. Return strictly valid JSON."
+    )
     response = client.models.generate_content(
         model=model_name,
         contents=[
-            _build_cv_prompt(),
+            prompt,
             types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
         ],
         config=types.GenerateContentConfig(
@@ -94,11 +78,15 @@ def extract_cv_fields_from_pdf_bytes(pdf_bytes: bytes, model_name: str = DEFAULT
     )
     return _extract_json_object(response.text or "")
 
-def _evaluate_candidate_against_requirements(requirements: str, extracted_cv: Dict[str, Any], model_name: str = DEFAULT_MODEL) -> Dict[str, Any]:
+def _evaluate_candidate_against_requirements(
+    requirements: str, 
+    extracted_cv: Dict[str, Any], 
+    model_name: str = DEFAULT_MODEL
+) -> Dict[str, Any]:
     client = _get_genai_client()
     prompt = (
         f"Job Requirements:\n{requirements}\n\n"
-        f"Candidate Qualifications:\n{json.dumps(extracted_cv)}\n\n"
+        f"Candidate Data:\n{json.dumps(extracted_cv)}\n\n"
         "Instructions: Compare the candidate's qualifications against the job requirements. "
         "Provide a match score (0-100) and a decision ('interview' or 'reject'). "
         "Return strictly valid JSON."
@@ -155,12 +143,14 @@ def on_application_created(
             "interviewEligible": screening["decision"] == "interview",
             "matchScore": screening["match_score"],
             "extractedData": extracted,
-            "processedAt": firestore.SERVER_TIMESTAMP
+            "processedAt": firestore.SERVER_TIMESTAMP,
+            "status": "completed"
         })
         
     except Exception as exc:
-        print(f"Error processing application: {exc}")
+        print(f"Error: {exc}")
         app_ref.update({
             "interviewEligible": False, 
-            "error": str(exc)
+            "error": str(exc),
+            "status": "failed"
         })
