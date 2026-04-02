@@ -1,19 +1,19 @@
 import json
 import os
 import re
-from typing import Any, Dict
+from typing import Any
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 load_dotenv()
 
 from firebase_admin import firestore, initialize_app, credentials
-from firebase_functions import firestore_fn
+from firebase_functions import https_fn  # Changed from firestore_fn
 from google import genai
 from google.genai import types
 
 PROJECT_ID = "deep-sync-production"
-DEFAULT_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_MODEL = "gemini-2.5-flash-lite" 
 SERVICE_ACCOUNT_PATH = "serviceAccountKey.json"
 ELIGIBILITY_THRESHOLD = 50
 
@@ -43,7 +43,7 @@ def _get_genai_client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 def _download_pdf_bytes(url: str) -> bytes:
-    request = Request(url, headers={"User-Agent": "Mozilla/5.0"}) # using an agent to scrap the data from the provided link.
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urlopen(request, timeout=30) as response:
         content = response.read()
     if not content.startswith(b"%PDF-"):
@@ -79,30 +79,31 @@ Return strictly valid JSON: {{"match_score": <int>}}
         match = re.search(r"(\d+)", response.text)
         return int(match.group(1)) if match else 0
 
-@firestore_fn.on_document_created(
-    document="career/{careerId}/applications/{applicationId}",
-)
-def on_application_created(
-    event: firestore_fn.Event[firestore_fn.DocumentSnapshot | None],
-) -> None:
-    snapshot = event.data
-    if not snapshot:
-        return
-    
-    db = get_db()
-    app_ref = snapshot.reference
-    app_data = snapshot.to_dict() or {}
+@https_fn.on_request()
+def on_application_triggered(req: https_fn.Request) -> https_fn.Response:
 
+    career_id = req.args.get("careerId")
+    app_id = req.args.get("applicationId")
+
+    if not career_id or not app_id:
+        return https_fn.Response("Missing careerId or applicationId", status=400)
+
+    db = get_db()
+    
     try:
+        app_ref = db.collection("career").document(career_id).collection("applications").document(app_id)
+        snapshot = app_ref.get()
+
+        if not snapshot.exists:
+            return https_fn.Response("Application not found", status=404)
+
+        app_data = snapshot.to_dict()
         resume_url = app_data.get("resumeUrl", "").strip()
+
         if not resume_url:
-            return
-        
-        career_id = event.params["careerId"]
+            return https_fn.Response("No resume URL found in document", status=400)
+
         career_doc = db.collection("career").document(career_id).get()
-        if not career_doc.exists:
-            return
-        
         job_requirements = career_doc.to_dict().get("requirements", "")
 
         pdf_bytes = _download_pdf_bytes(resume_url)
@@ -113,11 +114,13 @@ def on_application_created(
             "interviewEligible": match_score >= ELIGIBILITY_THRESHOLD,
             "processedAt": firestore.SERVER_TIMESTAMP
         })
-        
+
+        return https_fn.Response(json.dumps({
+            "status": "success",
+            "matchScore": match_score,
+            "eligible": match_score >= ELIGIBILITY_THRESHOLD
+        }), mimetype="application/json")
+
     except Exception as exc:
         print(f"Error: {exc}")
-        app_ref.update({
-            "interviewEligible": False, 
-            "matchScore": 0,
-            "processedAt": firestore.SERVER_TIMESTAMP
-        })
+        return https_fn.Response(f"Processing failed: {str(exc)}", status=500)
